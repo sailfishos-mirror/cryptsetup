@@ -142,10 +142,11 @@ static int luks2_decrypt_from_storage(char *dst, size_t dstLength,
 }
 
 static int luks2_keyslot_get_pbkdf_params(json_object *jobj_keyslot,
-		                struct crypt_pbkdf_type *pbkdf, char *salt)
+		                struct crypt_pbkdf_type *pbkdf, char **salt)
 {
 	json_object *jobj_kdf, *jobj1, *jobj2;
 	size_t salt_len;
+	int r;
 
 	if (!jobj_keyslot || !pbkdf)
 		return -EINVAL;
@@ -181,13 +182,16 @@ static int luks2_keyslot_get_pbkdf_params(json_object *jobj_keyslot,
 
 	if (!json_object_object_get_ex(jobj_kdf, "salt", &jobj2))
 		return -EINVAL;
-	salt_len = LUKS_SALTSIZE;
-	if (!base64_decode(json_object_get_string(jobj2),
-			   json_object_get_string_len(jobj2),
-			   salt, &salt_len))
+
+	r = crypt_base64_decode(salt, &salt_len, json_object_get_string(jobj2),
+				json_object_get_string_len(jobj2));
+	if (r < 0)
+		return r;
+
+	if (salt_len != LUKS_SALTSIZE) {
+		free(*salt);
 		return -EINVAL;
-	if (salt_len != LUKS_SALTSIZE)
-		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -198,7 +202,7 @@ static int luks2_keyslot_set_key(struct crypt_device *cd,
 	const char *volume_key, size_t volume_key_len)
 {
 	struct volume_key *derived_key;
-	char salt[LUKS_SALTSIZE], cipher[MAX_CIPHER_LEN], cipher_mode[MAX_CIPHER_LEN];
+	char *salt = NULL, cipher[MAX_CIPHER_LEN], cipher_mode[MAX_CIPHER_LEN];
 	char *AfKey = NULL;
 	const char *af_hash = NULL;
 	size_t AFEKSize, keyslot_key_len;
@@ -236,15 +240,18 @@ static int luks2_keyslot_set_key(struct crypt_device *cd,
 		return -EINVAL;
 	af_hash = json_object_get_string(jobj2);
 
-	if (luks2_keyslot_get_pbkdf_params(jobj_keyslot, &pbkdf, salt))
-		return -EINVAL;
+	r = luks2_keyslot_get_pbkdf_params(jobj_keyslot, &pbkdf, &salt);
+	if (r < 0)
+		return r;
 
 	/*
 	 * Allocate derived key storage.
 	 */
 	derived_key = crypt_alloc_volume_key(keyslot_key_len, NULL);
-	if (!derived_key)
+	if (!derived_key) {
+		free(salt);
 		return -ENOMEM;
+	}
 	/*
 	 * Calculate keyslot content, split and store it to keyslot area.
 	 */
@@ -253,6 +260,7 @@ static int luks2_keyslot_set_key(struct crypt_device *cd,
 			derived_key->key, derived_key->keylength,
 			pbkdf.iterations, pbkdf.max_memory_kb,
 			pbkdf.parallel_threads);
+	free(salt);
 	if (r < 0) {
 		crypt_free_volume_key(derived_key);
 		return r;
@@ -293,7 +301,7 @@ static int luks2_keyslot_get_key(struct crypt_device *cd,
 	char *AfKey;
 	size_t AFEKSize;
 	const char *af_hash = NULL;
-	char salt[LUKS_SALTSIZE], cipher[MAX_CIPHER_LEN], cipher_mode[MAX_CIPHER_LEN];
+	char *salt = NULL, cipher[MAX_CIPHER_LEN], cipher_mode[MAX_CIPHER_LEN];
 	json_object *jobj2, *jobj_af, *jobj_area;
 	uint64_t area_offset;
 	size_t keyslot_key_len;
@@ -302,9 +310,6 @@ static int luks2_keyslot_get_key(struct crypt_device *cd,
 
 	if (!json_object_object_get_ex(jobj_keyslot, "af", &jobj_af) ||
 	    !json_object_object_get_ex(jobj_keyslot, "area", &jobj_area))
-		return -EINVAL;
-
-	if (luks2_keyslot_get_pbkdf_params(jobj_keyslot, &pbkdf, salt))
 		return -EINVAL;
 
 	if (!json_object_object_get_ex(jobj_af, "hash", &jobj2))
@@ -325,23 +330,34 @@ static int luks2_keyslot_get_key(struct crypt_device *cd,
 		return -EINVAL;
 	keyslot_key_len = json_object_get_int(jobj2);
 
+	r = luks2_keyslot_get_pbkdf_params(jobj_keyslot, &pbkdf, &salt);
+	if (r < 0)
+		return r;
+
 	/*
 	 * If requested, serialize unlocking for memory-hard KDF. Usually NOOP.
 	 */
 	if (pbkdf.max_memory_kb > MIN_MEMORY_FOR_SERIALIZE_LOCK_KB)
 		try_serialize_lock = true;
-	if (try_serialize_lock && crypt_serialize_lock(cd))
+	if (try_serialize_lock && crypt_serialize_lock(cd)) {
+		free(salt);
 		return -EINVAL;
+	}
 	/*
 	 * Allocate derived key storage space.
 	 */
 	derived_key = crypt_alloc_volume_key(keyslot_key_len, NULL);
-	if (!derived_key)
+	if (!derived_key) {
+		/* FIXME: crypt_serialize_unlock */
+		free(salt);
 		return -ENOMEM;
+	}
 
 	AFEKSize = AF_split_sectors(volume_key_len, LUKS_STRIPES) * SECTOR_SIZE;
 	AfKey = crypt_safe_alloc(AFEKSize);
 	if (!AfKey) {
+		/* FIXME: crypt_serialize_unlock */
+		free(salt);
 		crypt_free_volume_key(derived_key);
 		return -ENOMEM;
 	}
@@ -353,6 +369,7 @@ static int luks2_keyslot_get_key(struct crypt_device *cd,
 			derived_key->key, derived_key->keylength,
 			pbkdf.iterations, pbkdf.max_memory_kb,
 			pbkdf.parallel_threads);
+	free(salt);
 
 	if (try_serialize_lock)
 		crypt_serialize_unlock(cd);
@@ -427,9 +444,9 @@ static int luks2_keyslot_update_json(struct crypt_device *cd,
 	r = crypt_random_get(cd, salt, LUKS_SALTSIZE, CRYPT_RND_SALT);
 	if (r < 0)
 		return r;
-	base64_encode_alloc(salt, LUKS_SALTSIZE, &salt_base64);
-	if (!salt_base64)
-		return -ENOMEM;
+	r = crypt_base64_encode(&salt_base64, NULL, salt, LUKS_SALTSIZE);
+	if (r < 0)
+		return r;
 	json_object_object_add(jobj_kdf, "salt", json_object_new_string(salt_base64));
 	free(salt_base64);
 
